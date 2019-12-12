@@ -62,7 +62,7 @@ def find_mac(task, macaddr, progress=None):
     return r_items if len(r_items) else None
 
 
-def test(inv, macaddr=, progress=None):
+def test(inv, macaddr, progress=None):
     res = inv.run(task=find_mac, macaddr=macaddr, progress=progress)
 
     return [
