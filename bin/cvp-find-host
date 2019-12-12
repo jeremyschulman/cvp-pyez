@@ -1,0 +1,558 @@
+#!/usr/bin/env python
+
+# -----------------------------------------------------------------------------
+# Python standard imports
+# -----------------------------------------------------------------------------
+
+import os
+import logging
+from functools import reduce
+from datetime import datetime
+from operator import attrgetter
+
+# -----------------------------------------------------------------------------
+# additional package imports
+# -----------------------------------------------------------------------------
+
+import maya
+import click
+from alive_progress import alive_bar
+from nornir import InitNornir
+from tabulate import tabulate
+
+# -----------------------------------------------------------------------------
+# CVP PyEZ imports
+# -----------------------------------------------------------------------------
+
+from cvppyez.log import setup_log
+from cvppyez.matcher import make_matcher
+from cvppyez import validators
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                               CONSTANTS
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+PROG_VERSION = '0.1.0'                      # bump on each release
+
+DEFAULT_LOGFILE = "/dev/null"
+DEFAULT_LOGLEVEL = 'warning'
+
+LN_SEP = "#" + "-" * 79
+TIME_FORMAT = "%Y-%m-%d (%a) %H:%M:%S"
+REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
+
+
+def get_inventory(ctx):
+    log = ctx.obj.log
+
+    log.info(f"Gathering CVP inventory from {os.environ['CVP_SERVER']}")
+    start_ts = datetime.now()
+    nr = InitNornir(
+        core={
+            'num_workers': 100
+        },
+        inventory={
+            'plugin': 'cvppyez.nornir.CVPInventory',
+            'options': dict(
+                groupby_tags=['device-role'],
+            ),
+        }
+    )
+    end_ts = datetime.now()
+    collect_td = end_ts - start_ts
+
+    log.info(f"CVP inventory gather took: {collect_td}")
+
+    nr.inventory.defaults.username = os.environ['CVP_USER']
+    nr.inventory.defaults.password = os.environ['CVP_PASSWORD']
+
+    ctx.obj.nr = nr
+    ctx.obj.search_nr = (nr if not ctx.obj.match_hostname else
+                         nr.filter(filter_func=lambda h: ctx.obj.match_hostname(h.name)))
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                          FIND HOST BY IP ADDR
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+def nr_task_find_ipaddr(task, ipaddr, progress=None):
+    """
+
+    Parameters
+    ----------
+    task
+    ipaddr
+    progress
+
+    Returns
+    -------
+
+    """
+
+    # use NAPALM driver to execute the command, but use the direct pyEAPI
+    # device so we get back structured data and not CLI text
+
+    np_dev = task.host.get_connection("napalm", task.nornir.config)
+
+    cmd_res = np_dev.device.run_commands(
+        commands=[
+            f'show ip arp {ipaddr}'
+        ]
+    )
+
+    ip_entries = cmd_res[0]['ipV4Neighbors']
+
+    if progress:
+        progress()
+
+    # if the IP address is not found, then return None
+
+    if not len(ip_entries):
+        return None
+
+    r_items = [
+        (entry['hwAddress'], entry['interface'])
+        for entry in ip_entries
+    ]
+
+    return r_items if len(r_items) else None
+
+
+def nr_find_host_by_ipaddr(nr, ipaddr, progress=None):
+    """
+    This function will execute the find-ip function against all hosts in the
+    `nr` Nornir object.  Any found item will be returned as a list of dict;
+    where each dict contains the hostname, macaddr, and interface where the IP
+    addr was found.
+
+    Parameters
+    ----------
+    nr : Nornir instance
+    ipaddr : str - IP address to find
+    progress : callable - to indicate progress
+
+    Returns
+    -------
+    list[dict] as described.
+    """
+
+    res = nr.run(task=nr_task_find_ipaddr, ipaddr=ipaddr, progress=progress)
+
+    # there will be a result for each of the hosts in the `inv` instance. We
+    # want to filter on only those results that are not None.  So the code
+    # below uses the built-in filter() to obtain the host item result to
+    # determine if it is None or not (as returned by the find_mac task.  If the
+    # results are not None then we iterate through the list of found entries
+    # for that device.
+
+    return [
+        dict(hostname=found.host.name, macaddr=item[0], interface=item[1])
+        for found in filter(attrgetter('result'), res.values())
+        for item in found.result
+    ]
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                          FIND HOST BY MACADDR
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+def nr_task_find_mac(task, macaddr, progress=None):
+    """
+    This Nornir task is used to locate the given `macaddr` on the device.  If
+    the MACADDR is found on Eth interfaces, then this function will return a
+    list of tuples (int: vlan-id, str: interface name).  If the MACADDR is not
+    found then this function will return None.
+
+    Notes
+    -----
+    There is a filter match on interface name starts with 'Eth' so we don't
+    include Port-Channels.  This is for demo-purposes only; and your specific
+    filtering criteria could vary.
+
+    Parameters
+    ----------
+    task : Nornir.task
+    macaddr : str - the MACADDR value to find
+    progress : function to declare progress
+
+    Returns
+    -------
+    list[tuple] or None as described.
+    """
+
+    # use NAPALM driver to execute the command
+
+    np_dev = task.host.get_connection("napalm", task.nornir.config)
+
+    # but use the direct pyEAPI device so we get back structured data and not
+    # CLI text
+
+    cmd_res = np_dev.device.run_commands(
+        commands=[
+            f'show mac address-table address {macaddr}'
+        ]
+    )
+
+    mac_entries = cmd_res[0]['unicastTable']['tableEntries']
+
+    if progress:
+        progress()
+
+    # if the MACADDR is not found, then return None
+
+    if not len(mac_entries):
+        return None
+
+    # filter matching on ETh interfaces only
+
+    r_items = [
+        (entry['vlanId'], entry['interface'])
+        for entry in mac_entries
+        if entry['interface'].startswith('Eth')
+    ]
+
+    return r_items if len(r_items) else None
+
+
+def nr_find_host_by_macaddr(nr, macaddr, progress=None):
+    """
+    This function will execute the find-mac function against all hosts in the
+    `inv` Nornir object.  Any found item will be returned as a list of dict; where
+    each dict contains the hostname, vlan, and interface where the MACADDR was found.
+
+    Parameters
+    ----------
+    nr : Nornir instance
+    macaddr : str - MACADDR to find
+
+    Returns
+    -------
+    list[dict] as described.
+    """
+
+    res = nr.run(task=nr_task_find_mac, macaddr=macaddr, progress=progress)
+
+    # there will be a result for each of the hosts in the `inv` instance. We
+    # want to filter on only those results that are not None.  So the code
+    # below uses the built-in filter() to obtain the host item result to
+    # determine if it is None or not (as returned by the find_mac task.  If the
+    # results are not None then we iterate through the list of found entries
+    # for that device.
+
+    return [
+        dict(hostname=found.host.name, vlan=item[0], interface=item[1])
+        for found in filter(attrgetter('result'), res.values())
+        for item in found.result
+    ]
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                              CLI OUTPUTS
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+def print_banner(ctx):
+    """
+    Prints the listing report banner consisting of the program name, version,
+    the start-end timestamps.
+
+    Parameters
+    ----------
+    optargs : dict - the CLI options
+    """
+    optargs = ctx.params
+
+    print("\n")
+    print(LN_SEP)
+    nowtime = maya.now().datetime(to_timezone="EST").strftime(TIME_FORMAT)
+    print(f"# {ctx.obj.prog_name}, version {PROG_VERSION}")
+    print(f"# CVP: {ctx.obj.cvp_user}@{ctx.obj.cvp_server}")
+    print(f"# TIME: {nowtime}")
+    if ctx.info_name == 'mac':
+        print(f"# FIND MACADDR: {optargs['macaddr']}")
+    elif ctx.info_name == 'mac':
+        print(f"# FIND IP ADDR: {optargs['ipaddr']}")
+
+    print(LN_SEP)
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                              CLICK CLI
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+class CLIContext(object):
+    pass
+
+
+class CLI(click.Group):
+    cli_help = """
+    This program is used to find an end host either by MAC address or IP
+    address. The host is found searching across a collection of devices.  This
+    program uses CVP as the inventory source.  You must setup the following
+    environment variables:
+
+        *  CVP_SERVER = hostname of your CVP server
+        *  CVP_USER = your login user name
+        *  CVP_PASSWORD = your login password
+
+    This program will use CVP to obtain the inventory, filter it based on your
+    options, and then scan the EOS devices over the eAPI directly.
+    """
+
+    def get_help(self, ctx):
+        return '\n'.join([
+            self.cli_help,
+            super(CLI, self).get_help(ctx)
+        ])
+
+    def invoke(self, ctx):
+
+        # ensure that all required Environment variables are setup before
+        # running the commands.
+
+        ctx.obj = CLIContext()
+
+        try:
+            all(os.environ[ev_name] for ev_name in REQ_ENV_VARS)
+
+        except KeyError as exc:
+            raise click.UsageError(
+                f'Missing Environment variable: {str(exc)}',
+                ctx=ctx
+            )
+
+        ctx.obj.prog_name = ctx.info_name
+        ctx.obj.cvp_server = os.environ['CVP_SERVER']
+        ctx.obj.cvp_user = os.environ['CVP_USER']
+
+        super(CLI, self).invoke(ctx)
+
+
+class Command(click.Command):
+    pattern_help = \
+        """
+Patterns: 
+    <glob-pattern>
+
+        Glob pattern matching is what is generally used with filepatterns in Unix
+        For example:
+
+            'foo*'          - All strings that start with 'foo'
+            'foo[12]*'      - All strings that start with foo1 or foo2
+
+        More online: https://en.wikipedia.org/wiki/Glob_(programming)
+
+    <regex-pattern>
+
+        Regular express matching.  If you're a network engineer, you're probably
+        familiar with regular expressiosn.   For example:
+
+            'sp.*'          - All strings that begin with 'sp'
+            '(sp|tr).*'     - All strings that begin with either 'sp' or 'tr'
+
+        More online: https://regex101.com/
+        """
+
+    def get_help(self, ctx):
+        return '\n'.join([
+            super(Command, self).get_help(ctx),
+            self.pattern_help
+        ])
+
+    def invoke(self, ctx):
+        optargs = ctx.params
+
+        log = ctx.obj.log = setup_log(optargs['log'])
+        log_level = optargs['log_level']
+        log.setLevel(logging.getLevelName(log_level.upper()))
+
+        search_hostname = optargs['hostname']
+        ctx.obj.match_hostname = (None if not search_hostname else
+                                  make_matcher('hostname', search_hostname,
+                                               use_regex=optargs['use_regex']))
+
+        super(Command, self).invoke(ctx)
+
+
+opt_use_regex = click.option(
+    '-R', '--use-regex',
+    help='Use regular expression pattern matching',
+    is_flag=True
+)
+
+opt_hostname = click.option(
+    '--hostname', '-h',
+    help='Search devices matching host name; use -R to enable regex',
+    metavar="[<glob-pattern>|<regex-pattern>]",
+)
+
+opt_find = click.option(
+    '-f', '--find',
+    help='Find value, either MAC address or IP address',
+    required=True
+)
+
+opt_log = click.option(
+    '--log',
+    help='log to file',
+    default=DEFAULT_LOGFILE
+)
+
+opt_log_level = click.option(
+    '--log-level',
+    help='logging level',
+    type=click.Choice(['debug', 'info', 'warning', 'error', 'critical']),
+    default=DEFAULT_LOGLEVEL,
+    callback=lambda ctx, param, value: value.upper() if value is not None else None
+)
+
+
+def opts_shared(cmd_func):
+    """
+    Create a decorator that combines all of the common options (shared) across
+    multiple commands. The decorator approach is used by the click framework
+    to add options to a give command.  This this function effective "stacks"
+    a bunch of options as a single decorator.
+
+    Parameters
+    ----------
+    cmd_func : function to decorate
+
+    Returns
+    -------
+    function - cmd_func now stacked with the common options.
+    """
+    return reduce(
+        lambda _f, opt_func: opt_func(_f), [
+            opt_hostname, opt_use_regex,
+            opt_log, opt_log_level],
+        cmd_func)
+
+
+@click.group(cls=CLI)
+@click.version_option(PROG_VERSION)
+def cli():
+    _ = """
+    This is the "toplevel" click object that we will use to run the program
+    commands.  It exists for command version and grouping purposes only.
+    """
+    pass
+
+
+@cli.command(name='mac', cls=Command)
+@click.argument(
+    'macaddr',
+    metavar='[MAC address]'
+)
+@opts_shared
+@click.pass_context
+def cli_find_host_mac(ctx, macaddr, **optargs):
+    """
+    Find end-host by MAC address.
+    """
+    v_macaddr = optargs['macaddr'] = validators.validate_macaddr(macaddr)
+    if not v_macaddr:
+        raise click.BadParameter(
+            f'macaddr "{macaddr}" is not a valid MAC address',
+            ctx=ctx
+        )
+
+    print("Gathering CVP inventory, please wait.")
+    get_inventory(ctx)
+    nr = ctx.obj.search_nr
+    n_devs = len(nr.inventory.hosts)
+    proceed = click.prompt(f"Search {n_devs} devices for MAC address {macaddr}? [Y/n]")
+    if proceed != 'Y':
+        raise click.Abort()
+
+    with alive_bar(len(nr.inventory.hosts)) as bar:
+        res = nr_find_host_by_macaddr(
+            nr=nr, macaddr=v_macaddr, progress=bar
+        )
+
+    if not len(res):
+        print("No matches.")
+        return
+
+    print_banner(ctx)
+
+    table = tabulate(headers=['Hostname', 'VLAN', 'Interface'],
+                     tabular_data=[
+                         [item['hostname'], item['vlan'], item['interface']]
+                         for item in res
+                     ])
+
+    print(f"\n{table}\n\n{LN_SEP}\n")
+
+
+@cli.command(name='ip', cls=Command)
+@click.argument(
+    'ipaddr',
+    metavar='[IP address]'
+)
+@opts_shared
+@click.pass_context
+def cli_find_host_ip(ctx, ipaddr, **optargs):
+    """
+    Find end-host by IP address.
+    """
+
+    v_ipaddr = optargs['ipaddr'] = validators.validate_ipaddr(ipaddr)
+
+    if not v_ipaddr:
+        raise click.BadParameter(
+            f'ipaddr "{ipaddr}" is not a valid IP address',
+            ctx=ctx
+        )
+
+    print("Gathering CVP inventory, please wait.")
+    get_inventory(ctx)
+    nr = ctx.obj.search_nr
+    n_devs = len(nr.inventory.hosts)
+    proceed = click.prompt(f"Search {n_devs} devices for IP address {ipaddr}? [Y/n]")
+    if proceed != 'Y':
+        raise click.Abort()
+
+    with alive_bar(len(nr.inventory.hosts)) as bar:
+        res = nr_find_host_by_ipaddr(
+            nr=nr, ipaddr=v_ipaddr, progress=bar
+        )
+
+    if not len(res):
+        print("No matches.")
+        return
+
+    print_banner(ctx)
+
+    table = tabulate(headers=['Hostname', 'MAC addr', 'Interface'],
+                     tabular_data=[
+                         [item['hostname'], item['macaddr'], item['interface']]
+                         for item in res
+                     ])
+
+    print(f"\n{table}\n\n{LN_SEP}\n")
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                                 MAIN
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+def main():
+    cli()
+
+
+if __name__ == "__main__":
+    main()

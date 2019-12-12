@@ -24,6 +24,6 @@ setup(
     packages=find_packages(),
     install_requires=requirements(),
     extras_require={
-        'nornir': ["nornir"]
+        'tools': requirements('requirements-tools.txt')
     }
 )

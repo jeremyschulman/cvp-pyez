@@ -120,7 +120,7 @@ def test(inv, macaddr, progress=None):
     # determine if it is None or not (as returned by the find_mac task.  If the
     # results are not None then we iterate through the list of found entries
     # for that device.
-    
+
     return [
         dict(hostname=found.host.name, vlan=item[0], interface=item[1])
         for found in filter(attrgetter('result'), res.values())
