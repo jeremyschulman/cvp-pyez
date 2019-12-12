@@ -7,6 +7,7 @@ from first import first
 from operator import attrgetter
 
 print("Retrieving inventory from CVP ")
+
 start_ts = datetime.now()
 nr = InitNornir(
     core={
@@ -37,7 +38,35 @@ def test_task(task):
 
 
 def find_mac(task, macaddr, progress=None):
+    """
+    This Nornir task is used to locate the given `macaddr` on the device.  If
+    the MACADDR is found on Eth interfaces, then this function will return a
+    list of tuples (int: vlan-id, str: interface name).  If the MACADDR is not
+    found then this function will return None.
+
+    Notes
+    -----
+    There is a filter match on interface name starts with 'Eth' so we don't
+    include Port-Channels.  This is for demo-purposes only; and your specific
+    filtering criteria could vary.
+
+    Parameters
+    ----------
+    task : Nornir.task
+    macaddr : str - the MACADDR value to find
+    progress : function to declare progress
+
+    Returns
+    -------
+    list[tuple] or None as described.
+    """
+
+    # use NAPALM driver to execute the command
+
     np_dev = task.host.get_connection("napalm", task.nornir.config)
+
+    # but use the direct pyEAPI device so we get back structured data and not
+    # CLI text
 
     cmd_res = np_dev.device.run_commands(
         commands=[
@@ -50,8 +79,12 @@ def find_mac(task, macaddr, progress=None):
     if progress:
         progress()
 
+    # if the MACADDR is not found, then return None
+
     if not len(mac_entries):
         return None
+
+    # filter matching on ETh interfaces only
 
     r_items = [
         (entry['vlanId'], entry['interface'])
@@ -63,6 +96,22 @@ def find_mac(task, macaddr, progress=None):
 
 
 def test(inv, macaddr, progress=None):
+    """
+    This function will execute the find-mac function against all hosts in the
+    `inv` Nornir object.  Any found item will be returned as a list of dict; where
+    each dict contains the hostname, vlan, and interface where the MACADDR was found.
+
+    Parameters
+    ----------
+    inv : Nornir instance
+    macaddr : str - MACADDR to find
+    progress : callable to indicate progress
+
+    Returns
+    -------
+    list[dict] as described.
+    """
+
     res = inv.run(task=find_mac, macaddr=macaddr, progress=progress)
 
     return [
@@ -70,7 +119,5 @@ def test(inv, macaddr, progress=None):
         for found in filter(attrgetter('result'), res.values())
         for item in found.result
     ]
-
-
 
 
