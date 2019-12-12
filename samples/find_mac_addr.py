@@ -114,6 +114,13 @@ def test(inv, macaddr, progress=None):
 
     res = inv.run(task=find_mac, macaddr=macaddr, progress=progress)
 
+    # there will be a result for each of the hosts in the `inv` instance. We
+    # want to filter on only those results that are not None.  So the code
+    # below uses the built-in filter() to obtain the host item result to
+    # determine if it is None or not (as returned by the find_mac task.  If the
+    # results are not None then we iterate through the list of found entries
+    # for that device.
+    
     return [
         dict(hostname=found.host.name, vlan=item[0], interface=item[1])
         for found in filter(attrgetter('result'), res.values())
