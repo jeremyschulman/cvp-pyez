@@ -1,4 +1,13 @@
 #!/usr/bin/env python
+# =============================================================================
+# PURPOSE
+# -------
+#    This script is used to scan EOS devices using CVP as the inventory source
+#    looking for either MAC addresses found from "show mac address-table
+#    <macaddr>" or for an IP address found from "show ip arp <ipaddr>".
+#
+#    For more information about this script use the "--help" command option.
+# =============================================================================
 
 # -----------------------------------------------------------------------------
 # Python standard imports
@@ -95,7 +104,7 @@ def nr_task_find_ipaddr(task, ipaddr, progress=None):
     """
 
     # use NAPALM driver to execute the command, but use the direct pyEAPI
-    # device so we get back structured data and not CLI text
+    # device so we get back structured data and not Command text
 
     np_dev = task.host.get_connection("napalm", task.nornir.config)
 
@@ -192,7 +201,7 @@ def nr_task_find_mac(task, macaddr, progress=None):
     np_dev = task.host.get_connection("napalm", task.nornir.config)
 
     # but use the direct pyEAPI device so we get back structured data and not
-    # CLI text
+    # Command text
 
     cmd_res = np_dev.device.run_commands(
         commands=[
@@ -255,7 +264,7 @@ def nr_find_host_by_macaddr(nr, macaddr, progress=None):
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
-# !                              CLI OUTPUTS
+# !                              Command OUTPUTS
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -266,7 +275,7 @@ def print_banner(ctx):
 
     Parameters
     ----------
-    optargs : dict - the CLI options
+    optargs : dict - the Command options
     """
     optargs = ctx.params
 
@@ -286,7 +295,7 @@ def print_banner(ctx):
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
-# !                              CLICK CLI
+# !                              CLICK Command
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 

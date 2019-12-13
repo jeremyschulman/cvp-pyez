@@ -1,6 +1,7 @@
 
 
 from setuptools import setup, find_packages
+from pathlib import Path
 
 package_version = '0.1.0'
 package_name = 'cvp-pyez'
@@ -23,7 +24,5 @@ setup(
     author='Jeremy Schulman',
     packages=find_packages(),
     install_requires=requirements(),
-    extras_require={
-        'tools': requirements('requirements-tools.txt')
-    }
+    scripts=[str(script) for script in Path('bin').iterdir()]
 )

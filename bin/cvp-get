@@ -1,0 +1,476 @@
+#!/usr/bin/env python
+# =============================================================================
+# PURPOSE
+# -------
+#    This script is used to gather logging content from EOS devices using CVP
+#    as the inventory source. The collected log information is stored to a
+#    hostname specific file called <hostname>.log.
+#
+#
+#    For more information about this script use the "--help" command option.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python standard imports
+# -----------------------------------------------------------------------------
+
+import os
+import logging
+from functools import reduce
+from datetime import datetime
+
+# -----------------------------------------------------------------------------
+# additional package imports
+# -----------------------------------------------------------------------------
+
+import maya
+import click
+from alive_progress import alive_bar
+from nornir import InitNornir
+from nornir.plugins.tasks.files import write_file
+from tabulate import tabulate
+
+# -----------------------------------------------------------------------------
+# CVP PyEZ imports
+# -----------------------------------------------------------------------------
+
+from cvppyez.log import setup_log
+from cvppyez.matcher import make_matcher
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                               CONSTANTS
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+PROG_VERSION = '0.2.1'                      # bump on each release
+
+DEFAULT_LOGFILE = "/dev/null"
+DEFAULT_LOGLEVEL = 'warning'
+
+LN_SEP = "#" + "-" * 79
+TIME_FORMAT = "%Y-%m-%d (%a) %H:%M:%S"
+REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                             NORNIR
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+def nr_get_inventory(ctx):
+    """
+    This function will use the Nornir to gather the device inventory from CVP.
+    The User can provide a hostname based filter to apply to the complete
+    inventory so that they can limit the scope of the scan. As a result of this
+    processing the `ctx.obj.nr` will be set to the filtered list of devices to
+    scan.  The `ctx.obj.nr_all` is the complete CVP inventory.
+
+    Parameters
+    ----------
+    ctx : click.Context
+    """
+    log = ctx.obj.log
+
+    log.info(f"Gathering CVP inventory from {os.environ['CVP_SERVER']}")
+    start_ts = datetime.now()
+    nr = InitNornir(
+        core={
+            'num_workers': 100
+        },
+        inventory={
+            'plugin': 'cvppyez.nornir.CVPInventory'
+        }
+    )
+    end_ts = datetime.now()
+    collect_td = end_ts - start_ts
+
+    log.info(f"CVP inventory gather took: {collect_td}")
+
+    nr.inventory.defaults.username = os.environ['CVP_USER']
+    nr.inventory.defaults.password = os.environ['CVP_PASSWORD']
+
+    ctx.obj.nr_all = nr
+    ctx.obj.nr = (nr if not ctx.obj.match_hostname else
+                  nr.filter(filter_func=lambda h: ctx.obj.match_hostname(h.name)))
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                               GET LOGS
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+def nr_task_get_logs(task, progress=None):
+    """
+    This Nornir task is used to collect the logs from the device and then
+    save them to a hostname specific file.
+
+
+    Parameters
+    ----------
+    task : Nornir Task
+    progress : callable - used to indicate progress
+
+    Returns
+    -------
+    None
+    """
+
+    # use NAPALM driver to execute the command.  Using the underlying pyEapi
+    # device object and allowing for up to 10min to collect the logging data.
+    # This time increase was done because some devices are ~slow~; and some
+    # have lots of logs.
+    # TODO: make the timeout a Command option.
+
+    np_dev = task.host.get_connection("napalm", task.nornir.config)
+    eos_dev = np_dev.device
+    eos_dev.connection.transport.timeout = 10 * 60       # extend for longer timeout period!
+
+    # collect the logs from the last 1 day
+    # TODO: make the collection period a Command option.
+
+    cmd_res = eos_dev.run_commands(
+        commands=[
+            'show logging last 1 days'
+        ],
+        encoding='text'
+    )
+
+    # save the collected log output (text) to a file.
+    # TODO: add Command option to indicate directory to store; maybe
+    #       even the logging filename format.
+
+    output = cmd_res[0]['output']
+    hostname = task.host.name
+    task.run(task=write_file, filename=f'{hostname}.log', content=output)
+
+    if progress:
+        progress()
+
+
+def nr_task_get_running_config(task, progress=None):
+    """
+    This Nornir task is used to collect the logs from the device and then
+    save them to a hostname specific file.
+
+
+    Parameters
+    ----------
+    task : Nornir Task
+    progress : callable - used to indicate progress
+
+    Returns
+    -------
+    None
+    """
+
+    np_dev = task.host.get_connection("napalm", task.nornir.config)
+    eos_dev = np_dev.device
+
+    # collect the logs from the last 1 day
+    # TODO: make the collection period a Command option.
+
+    cmd_res = eos_dev.run_commands(
+        commands=[
+            'show running-config'
+        ],
+        encoding='text'
+    )
+
+    # save the collected log output (text) to a file.
+    # TODO: add Command option to indicate directory to store; maybe
+    #       even the logging filename format.
+
+    output = cmd_res[0]['output']
+    hostname = task.host.name
+    task.run(task=write_file, filename=f'{hostname}.cfg', content=output)
+
+    if progress:
+        progress()
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                              Command REPORT BANNER
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+def print_banner(ctx):
+    print("\n")
+    print(LN_SEP)
+    nowtime = maya.now().datetime(to_timezone="EST").strftime(TIME_FORMAT)
+    print(f"# {ctx.obj.prog_name}, version {PROG_VERSION}")
+    print(f"# CVP: {ctx.obj.cvp_user}@{ctx.obj.cvp_server}")
+    print(f"# TIME: {nowtime}")
+    print(LN_SEP)
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                              CLICK Command
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# -----------------------------------------------------------------------------
+#                             CUSTOMIZE CLICK COMMANDS
+# -----------------------------------------------------------------------------
+
+class CLIContext(object):
+    pass
+
+
+class Command(click.Command):
+    cli_help = ''
+
+    cvp_help = """        
+    You must setup the following environment variables:
+
+        *  CVP_SERVER = hostname of your CVP server
+        *  CVP_USER = your login user name
+        *  CVP_PASSWORD = your login password
+
+    This program will use CVP to obtain the inventory, filter it based on your
+    options, and then scan the EOS devices over the eAPI directly.
+    """
+
+    pattern_help = \
+        """
+Patterns: 
+    <glob-pattern>
+
+        Glob pattern matching is what is generally used with filepatterns in Unix
+        For example:
+
+            'foo*'          - All strings that start with 'foo'
+            'foo[12]*'      - All strings that start with foo1 or foo2
+
+        More online: https://en.wikipedia.org/wiki/Glob_(programming)
+
+    <regex-pattern>
+
+        Regular express matching.  If you're a network engineer, you're probably
+        familiar with regular expressiosn.   For example:
+
+            'sp.*'          - All strings that begin with 'sp'
+            '(sp|tr).*'     - All strings that begin with either 'sp' or 'tr'
+
+        More online: https://regex101.com/
+        """
+
+    def get_help(self, ctx):
+        """ customize the --help output """
+        return '\n'.join([
+            self.cli_help,
+            self.cvp_help,
+            super(Command, self).get_help(ctx),
+            self.pattern_help
+        ])
+
+    def invoke(self, ctx):
+
+        # ensure that all required Environment variables are setup before
+        # running the commands.
+
+        ctx.obj = CLIContext()
+
+        try:
+            all(os.environ[ev_name] for ev_name in REQ_ENV_VARS)
+
+        except KeyError as exc:
+            raise click.UsageError(
+                f'Missing Environment variable: {str(exc)}',
+                ctx=ctx
+            )
+
+        ctx.obj.prog_name = ctx.info_name
+        ctx.obj.cvp_server = os.environ['CVP_SERVER']
+        ctx.obj.cvp_user = os.environ['CVP_USER']
+
+        optargs = ctx.params
+
+        log = ctx.obj.log = setup_log(optargs['log'])
+        log_level = optargs['log_level']
+        log.setLevel(logging.getLevelName(log_level.upper()))
+
+        # if the User provided a hostname filter, then setup for that matching.
+        # the `match_hostname` function will be used when collecting the Nornir
+        # inventory from CVP.
+
+        search_hostname = optargs['hostname']
+        ctx.obj.match_hostname = (None if not search_hostname else
+                                  make_matcher('hostname', search_hostname,
+                                               use_regex=optargs['use_regex']))
+
+        super(Command, self).invoke(ctx)
+
+
+class GetLogsCommand(Command):
+    cli_help = """
+    This program is used to collect the device logging data for a specified
+    period of time and save them to file.
+    """
+    pass
+
+
+# -----------------------------------------------------------------------------
+#                           Command options
+# -----------------------------------------------------------------------------
+
+opt_use_regex = click.option(
+    '-R', '--use-regex',
+    help='Use regular expression pattern matching',
+    is_flag=True
+)
+
+opt_hostname = click.option(
+    '--hostname', '-h',
+    help='Search devices matching host name; use -R to enable regex',
+    metavar="[<glob-pattern>|<regex-pattern>]",
+)
+
+opt_log = click.option(
+    '--log',
+    help='log to file',
+    default=DEFAULT_LOGFILE
+)
+
+opt_log_level = click.option(
+    '--log-level',
+    help='logging level',
+    type=click.Choice(['debug', 'info', 'warning', 'error', 'critical']),
+    default=DEFAULT_LOGLEVEL,
+    callback=lambda ctx, param, value: value.upper() if value is not None else None
+)
+
+
+def opts_shared(cmd_func):
+    """
+    Create a decorator that combines all of the common options (shared) across
+    multiple commands. The decorator approach is used by the click framework
+    to add options to a give command.  This this function effective "stacks"
+    a bunch of options as a single decorator.
+
+    Parameters
+    ----------
+    cmd_func : function to decorate
+
+    Returns
+    -------
+    function - cmd_func now stacked with the common options.
+    """
+    return reduce(
+        lambda _f, opt_func: opt_func(_f), [
+            opt_hostname, opt_use_regex,
+            opt_log, opt_log_level],
+        cmd_func)
+
+
+# -----------------------------------------------------------------------------
+#                                 CLICK Command COMMAND
+# -----------------------------------------------------------------------------
+
+@click.group()
+@click.version_option(PROG_VERSION)
+def cli():
+    pass
+
+
+# -----------------------------------------------------------------------------
+#                                 CLICK Command COMMAND
+# -----------------------------------------------------------------------------
+
+@cli.command(name='logs', cls=GetLogsCommand)
+@click.version_option(PROG_VERSION)
+@opts_shared
+@click.pass_context
+def cli_get_logs(ctx, **optargs):
+    """
+    Get system logs from the device and save to local file.
+    """
+    print("Gathering CVP inventory, please wait.")
+
+    nr_get_inventory(ctx)
+    nr = ctx.obj.nr
+    n_devs = len(nr.inventory.hosts)
+    if not n_devs:
+        print("No devices match hostname filter")
+        return
+
+    proceed = click.prompt(f"Collect logs from {n_devs} devices? [Y/n]")
+    if proceed != 'Y':
+        raise click.Abort()
+
+    # use a fancy progress bar to show progress. if you need to debug the task
+    # using pdb/breakpoints, do not use this progress bar as it adds background
+    # threading and prevents debuggin of tasks.
+
+    with alive_bar(len(nr.inventory.hosts)) as bar:
+        res = nr.run(task=nr_task_get_logs, progress=bar)
+
+    # NOTE: for debugging, replace the above with this
+    # nr.run(task=nr_task_get_logs)
+
+    if res.failed:
+        print("Execution errors detected on hosts:")
+        failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
+        print(tabulate(
+            headers=['hostname', 'result'],
+            tabular_data=failed
+        ))
+
+
+@cli.command(name='configs', cls=GetLogsCommand)
+@click.version_option(PROG_VERSION)
+@opts_shared
+@click.pass_context
+def cli_get_running(ctx, **optargs):
+    """
+    Get running configuration from the device and save to local file.
+    """
+    print("Gathering CVP inventory, please wait.")
+
+    nr_get_inventory(ctx)
+    nr = ctx.obj.nr
+    n_devs = len(nr.inventory.hosts)
+    if not n_devs:
+        print("No devices match hostname filter")
+        return
+
+    proceed = click.prompt(f"Collect from {n_devs} devices? [Y/n]")
+    if proceed != 'Y':
+        raise click.Abort()
+
+    # use a fancy progress bar to show progress. if you need to debug the task
+    # using pdb/breakpoints, do not use this progress bar as it adds background
+    # threading and prevents debuggin of tasks.
+
+    with alive_bar(len(nr.inventory.hosts)) as bar:
+        res = nr.run(task=nr_task_get_running_config, progress=bar)
+
+    # NOTE: for debugging, replace the above with this
+    # nr.run(task=nr_task_get_logs)
+
+    if res.failed:
+        print("Execution errors detected on hosts:")
+        failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
+        print(tabulate(
+            headers=['hostname', 'result'],
+            tabular_data=failed
+        ))
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                                 MAIN
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+def main():
+    cli()
+
+
+if __name__ == "__main__":
+    main()

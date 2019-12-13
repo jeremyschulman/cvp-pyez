@@ -1,3 +1,10 @@
+first
 requests
 paramiko
 jsonlines
+napalm<2.5.0
+nornir
+click
+tabulate
+maya
+alive-progress

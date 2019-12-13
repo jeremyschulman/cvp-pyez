@@ -16,7 +16,7 @@ def make_matcher(name, value, use_regex):
     Parameters
     ----------
     name : str - parameter name, e.g. "hostname"
-    value : str - the CLI parameter value, e.g. "tr*"
+    value : str - the Command parameter value, e.g. "tr*"
     use_regex : bool - True if match using regex, False use glob
 
     Returns
