@@ -1,0 +1,337 @@
+#!/usr/bin/env python
+# =============================================================================
+# PURPOSE
+# -------
+#
+#    This program is used to push configuration from a file to a collection of
+#    devices; the inventory is taken from CVP and Nornir is used to execute the
+#    change. A dry-run option is supported as well.
+#
+#    For more information about this script use the "--help" command option.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python standard imports
+# -----------------------------------------------------------------------------
+
+import os
+import logging
+from functools import reduce
+
+# -----------------------------------------------------------------------------
+# additional package imports
+# -----------------------------------------------------------------------------
+
+import maya
+import click
+from alive_progress import alive_bar
+from nornir.plugins.tasks.networking import napalm_configure
+from tabulate import tabulate
+
+# -----------------------------------------------------------------------------
+# CVP PyEZ imports
+# -----------------------------------------------------------------------------
+
+from cvppyez.log import setup_log
+from cvppyez.matcher import make_matcher
+from cvppyez.nornir import get_inventory
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                               CONSTANTS
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+PROG_VERSION = '0.1.0'                      # bump on each release
+
+DEFAULT_LOGFILE = "/dev/null"
+DEFAULT_LOGLEVEL = 'warning'
+
+LN_SEP = "#" + "-" * 79
+TIME_FORMAT = "%Y-%m-%d (%a) %H:%M:%S"
+REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                               NORNIR
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+def nr_task_push_config(task, dry_run, configuration, progress=None):
+    """
+    This Nornir task is used to wrap the napalm_configure so that we can
+    include the fancy progress bar.
+
+    Parameters
+    ----------
+    task : Nornir Task
+    dry_run : bool
+    configuration : str - the config to push
+    progress : callable - used to indicate progress
+
+    Returns
+    -------
+    None
+    """
+
+    res = task.run(task=napalm_configure,
+                   dry_run=dry_run,
+                   configuration=configuration)
+
+    if progress:
+        progress()
+
+    return res
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                              Command REPORT BANNER
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+def print_banner(ctx):
+    print("\n")
+    print(LN_SEP)
+    nowtime = maya.now().datetime(to_timezone="EST").strftime(TIME_FORMAT)
+    print(f"# {ctx.obj.prog_name}, version {PROG_VERSION}")
+    print(f"# CVP: {ctx.obj.cvp_user}@{ctx.obj.cvp_server}")
+    print(f"# TIME: {nowtime}")
+    print(LN_SEP)
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                              CLICK Command
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# -----------------------------------------------------------------------------
+#                             CUSTOMIZE CLICK COMMANDS
+# -----------------------------------------------------------------------------
+
+class CLIContext(object):
+    pass
+
+
+class Command(click.Command):
+    cli_help = """
+    This command is used to push configs from a local file to devices."""
+
+    cvp_help = \
+        """
+    You must setup the following environment variables:
+
+        *  CVP_SERVER = hostname of your CVP server
+        *  CVP_USER = your login user name
+        *  CVP_PASSWORD = your login password
+
+    This program will use CVP to obtain the inventory, filter it based on your
+    options, and then access the EOS devices over the eAPI directly.
+    """
+
+    pattern_help = \
+        """
+Patterns: 
+    <glob-pattern>
+
+        Glob pattern matching is what is generally used with filepatterns in Unix
+        For example:
+
+            'foo*'          - All strings that start with 'foo'
+            'foo[12]*'      - All strings that start with foo1 or foo2
+
+        More online: https://en.wikipedia.org/wiki/Glob_(programming)
+
+    <regex-pattern>
+
+        Regular express matching.  If you're a network engineer, you're probably
+        familiar with regular expressiosn.   For example:
+
+            'sp.*'          - All strings that begin with 'sp'
+            '(sp|tr).*'     - All strings that begin with either 'sp' or 'tr'
+
+        More online: https://regex101.com/
+        """
+
+    def get_help(self, ctx):
+        """ customize the --help output """
+        return '\n'.join([
+            self.cli_help,
+            self.cvp_help,
+            super(Command, self).get_help(ctx),
+            self.pattern_help
+        ])
+
+    def invoke(self, ctx):
+
+        # ensure that all required Environment variables are setup before
+        # running the commands.
+
+        ctx.obj = CLIContext()
+
+        try:
+            all(os.environ[ev_name] for ev_name in REQ_ENV_VARS)
+
+        except KeyError as exc:
+            raise click.UsageError(
+                f'Missing Environment variable: {str(exc)}',
+                ctx=ctx
+            )
+
+        ctx.obj.prog_name = ctx.info_name
+        ctx.obj.cvp_server = os.environ['CVP_SERVER']
+        ctx.obj.cvp_user = os.environ['CVP_USER']
+
+        optargs = ctx.params
+
+        log = ctx.obj.log = setup_log(optargs['log'])
+        log_level = optargs['log_level']
+        log.setLevel(logging.getLevelName(log_level.upper()))
+
+        # if the User provided a hostname filter, then setup for that matching.
+        # the `match_hostname` function will be used when collecting the Nornir
+        # inventory from CVP.
+
+        search_hostname = optargs['hostname']
+        ctx.obj.match_hostname = (None if not search_hostname else
+                                  make_matcher('hostname', search_hostname,
+                                               use_regex=optargs['use_regex']))
+
+        super(Command, self).invoke(ctx)
+
+
+# -----------------------------------------------------------------------------
+#                           Command options
+# -----------------------------------------------------------------------------
+
+opt_config_file = click.option(
+    '--configfile', required=True,
+    type=click.File(),
+    help='File containing configuraiton to push to devices'
+)
+
+opt_dry_run = click.option(
+    '--dry-run', is_flag=True,
+    help='Use dry-run mode for checking (no config commit)'
+)
+
+opt_use_regex = click.option(
+    '-R', '--use-regex',
+    help='Use regular expression pattern matching',
+    is_flag=True
+)
+
+opt_hostname = click.option(
+    '--hostname', '-h',
+    help='Search devices matching host name; use -R to enable regex',
+    metavar="[<glob-pattern>|<regex-pattern>]",
+)
+
+opt_log = click.option(
+    '--log',
+    help='log to file',
+    default=DEFAULT_LOGFILE
+)
+
+opt_log_level = click.option(
+    '--log-level',
+    help='logging level',
+    type=click.Choice(['debug', 'info', 'warning', 'error', 'critical']),
+    default=DEFAULT_LOGLEVEL,
+    callback=lambda ctx, param, value: value.upper() if value is not None else None
+)
+
+
+def opts_shared(cmd_func):
+    """
+    Create a decorator that combines all of the common options (shared) across
+    multiple commands. The decorator approach is used by the click framework
+    to add options to a give command.  This this function effective "stacks"
+    a bunch of options as a single decorator.
+
+    Parameters
+    ----------
+    cmd_func : function to decorate
+
+    Returns
+    -------
+    function - cmd_func now stacked with the common options.
+    """
+    return reduce(
+        lambda _f, opt_func: opt_func(_f), [
+            opt_config_file, opt_dry_run,
+            opt_hostname, opt_use_regex,
+            opt_log, opt_log_level],
+        cmd_func)
+
+
+# -----------------------------------------------------------------------------
+#                                 CLICK Command COMMAND
+# -----------------------------------------------------------------------------
+
+@click.command(cls=Command)
+@click.version_option(PROG_VERSION)
+@opts_shared
+@click.pass_context
+def cli_push_config(ctx, configfile, **optargs):
+    """
+    Push configuration from file to devices.
+    """
+    print("Gathering CVP inventory, please wait.")
+
+    nr = ctx.obj.nr = get_inventory(
+        log=ctx.obj.log, match_hostname=ctx.obj.match_hostname)
+
+    n_devs = len(nr.inventory.hosts)
+    if not n_devs:
+        print("No devices match hostname filter")
+        return
+
+    proceed = click.prompt(f"Configure {n_devs} devices? [Y/n]")
+    if proceed != 'Y':
+        raise click.Abort()
+
+    # use a fancy progress bar to show progress. if you need to debug the task
+    # using pdb/breakpoints, do not use this progress bar as it adds background
+    # threading and prevents debuggin of tasks.
+
+    with alive_bar(len(nr.inventory.hosts)) as bar:
+        res = nr.run(task=nr_task_push_config, progress=bar,
+                     dry_run=optargs['dry_run'],
+                     configuration=configfile.read())
+
+    if res.failed:
+        print("Execution errors detected on hosts:")
+        failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
+        print(tabulate(
+            headers=['hostname', 'result'],
+            tabular_data=failed
+        ))
+
+    table = tabulate(
+        headers=['Hostname', 'Diff'],
+        tabular_data=[
+            [host, bool(h_res[1].diff)]
+            for host, h_res in res.items()
+        ]
+    )
+
+    print_banner(ctx)
+    print(f"\n{table}\n\n{LN_SEP}\n")
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                                 MAIN
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+def main():
+    cli_push_config()
+
+
+if __name__ == "__main__":
+    main()
