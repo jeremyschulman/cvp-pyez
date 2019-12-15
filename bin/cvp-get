@@ -43,7 +43,7 @@ from cvppyez.matcher import make_matcher
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.2.1'                      # bump on each release
+PROG_VERSION = '0.3.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -102,7 +102,7 @@ def nr_get_inventory(ctx):
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-def nr_task_get_logs(task, progress=None):
+def nr_task_get_logs(task, timeframe, progress=None):
     """
     This Nornir task is used to collect the logs from the device and then
     save them to a hostname specific file.
@@ -111,6 +111,7 @@ def nr_task_get_logs(task, progress=None):
     Parameters
     ----------
     task : Nornir Task
+    timeframe : str - per EOS logging command
     progress : callable - used to indicate progress
 
     Returns
@@ -133,7 +134,7 @@ def nr_task_get_logs(task, progress=None):
 
     cmd_res = eos_dev.run_commands(
         commands=[
-            'show logging last 1 days'
+            f'show logging last {timeframe}'
         ],
         encoding='text'
     )
@@ -204,6 +205,10 @@ def print_banner(ctx):
     print(f"# {ctx.obj.prog_name}, version {PROG_VERSION}")
     print(f"# CVP: {ctx.obj.cvp_user}@{ctx.obj.cvp_server}")
     print(f"# TIME: {nowtime}")
+
+    if ctx.info_name == 'logs':
+        print(f'# LOG TIME-FRAME: {ctx.params["last"]}')
+
     print(LN_SEP)
 
 
@@ -345,6 +350,44 @@ opt_log_level = click.option(
 )
 
 
+def opt_log_lasttimeframe_check(ctx, param, value):
+    """ EOS timeframe validator """
+    time_n, time_scope = value.split(' ')
+
+    try:
+        time_n = int(time_n)
+        if not 1 <= time_n <= 9999:
+            raise click.UsageError(
+                f'Invalid timeframe number {time_n}, must be 1-9999',
+                ctx=ctx
+            )
+
+    except ValueError:
+        raise click.UsageError(
+            f'Invalid timeframe: {value}, not a number',
+            ctx=ctx
+        )
+
+    scopes = ['days', 'hours', 'minutes', 'seconds']
+
+    if time_scope not in scopes:
+        raise click.UsageError(
+            f'Invalid timeframe scope: {time_scope}, must be one of {scopes}',
+            ctx=ctx
+        )
+
+    return value
+
+
+opt_log_lasttimeframe = click.option(
+    '--last',
+    help='logging last timeframe, e.g. "1 days"',
+    callback=opt_log_lasttimeframe_check,
+    metavar='[EOS timeframe]',
+    default='1 days'
+)
+
+
 def opts_shared(cmd_func):
     """
     Create a decorator that combines all of the common options (shared) across
@@ -384,6 +427,7 @@ def cli():
 @cli.command(name='logs', cls=GetLogsCommand)
 @click.version_option(PROG_VERSION)
 @opts_shared
+@opt_log_lasttimeframe
 @click.pass_context
 def cli_get_logs(ctx, **optargs):
     """
@@ -402,12 +446,15 @@ def cli_get_logs(ctx, **optargs):
     if proceed != 'Y':
         raise click.Abort()
 
+    print_banner(ctx)
+
     # use a fancy progress bar to show progress. if you need to debug the task
     # using pdb/breakpoints, do not use this progress bar as it adds background
     # threading and prevents debuggin of tasks.
 
     with alive_bar(len(nr.inventory.hosts)) as bar:
-        res = nr.run(task=nr_task_get_logs, progress=bar)
+        res = nr.run(task=nr_task_get_logs, timeframe=optargs['last'],
+                     progress=bar)
 
     # NOTE: for debugging, replace the above with this
     # nr.run(task=nr_task_get_logs)
