@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # =============================================================================
 # PURPOSE
 # -------
@@ -16,7 +16,6 @@
 import os
 import logging
 from functools import reduce
-from datetime import datetime
 from operator import attrgetter
 
 # -----------------------------------------------------------------------------
@@ -26,7 +25,6 @@ from operator import attrgetter
 import maya
 import click
 from alive_progress import alive_bar
-from nornir import InitNornir
 from tabulate import tabulate
 
 # -----------------------------------------------------------------------------
@@ -36,6 +34,7 @@ from tabulate import tabulate
 from cvppyez.log import setup_log
 from cvppyez.matcher import make_matcher
 from cvppyez import validators
+from cvppyez.nornir import get_inventory
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
@@ -43,7 +42,7 @@ from cvppyez import validators
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.1.0'                      # bump on each release
+PROG_VERSION = '0.4.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -51,35 +50,6 @@ DEFAULT_LOGLEVEL = 'warning'
 LN_SEP = "#" + "-" * 79
 TIME_FORMAT = "%Y-%m-%d (%a) %H:%M:%S"
 REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
-
-
-def get_inventory(ctx):
-    log = ctx.obj.log
-
-    log.info(f"Gathering CVP inventory from {os.environ['CVP_SERVER']}")
-    start_ts = datetime.now()
-    nr = InitNornir(
-        core={
-            'num_workers': 100
-        },
-        inventory={
-            'plugin': 'cvppyez.nornir.CVPInventory',
-            'options': dict(
-                groupby_tags=['device-role'],
-            ),
-        }
-    )
-    end_ts = datetime.now()
-    collect_td = end_ts - start_ts
-
-    log.info(f"CVP inventory gather took: {collect_td}")
-
-    nr.inventory.defaults.username = os.environ['CVP_USER']
-    nr.inventory.defaults.password = os.environ['CVP_PASSWORD']
-
-    ctx.obj.nr = nr
-    ctx.obj.search_nr = (nr if not ctx.obj.match_hostname else
-                         nr.filter(filter_func=lambda h: ctx.obj.match_hostname(h.name)))
 
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -240,6 +210,7 @@ def nr_find_host_by_macaddr(nr, macaddr, progress=None):
     ----------
     nr : Nornir instance
     macaddr : str - MACADDR to find
+    progress : callable - indicates progress
 
     Returns
     -------
@@ -275,7 +246,7 @@ def print_banner(ctx):
 
     Parameters
     ----------
-    optargs : dict - the Command options
+    ctx : click.Context
     """
     optargs = ctx.params
 
@@ -386,9 +357,13 @@ Patterns:
         log.setLevel(logging.getLevelName(log_level.upper()))
 
         search_hostname = optargs['hostname']
-        ctx.obj.match_hostname = (None if not search_hostname else
-                                  make_matcher('hostname', search_hostname,
-                                               use_regex=optargs['use_regex']))
+        if not search_hostname:
+            ctx.obj.filter_func = None
+        else:
+            match_hostname = make_matcher(
+                name='hostname', value=search_hostname,
+                use_regex=optargs['use_regex'])
+            ctx.obj.filter_func = lambda h: match_hostname(h.name)
 
         super(Command, self).invoke(ctx)
 
@@ -524,10 +499,16 @@ def cli_find_host_ip(ctx, ipaddr, **optargs):
             ctx=ctx
         )
 
+    print_banner(ctx)
     print("Gathering CVP inventory, please wait.")
-    get_inventory(ctx)
-    nr = ctx.obj.search_nr
+
+    nr = get_inventory(filter_func=ctx.obj.filter_func)
     n_devs = len(nr.inventory.hosts)
+
+    if not n_devs:
+        print("No hostname matches in CVP inventory")
+        exit(1)
+
     proceed = click.prompt(f"Search {n_devs} devices for IP address {ipaddr}? [Y/n]")
     if proceed != 'Y':
         raise click.Abort()
@@ -541,11 +522,38 @@ def cli_find_host_ip(ctx, ipaddr, **optargs):
         print("No matches.")
         return
 
-    print_banner(ctx)
+    table_data = [
+        [item['hostname'], item['macaddr'], item['interface']]
+        for item in res
+    ]
 
     table = tabulate(headers=['Hostname', 'MAC addr', 'Interface'],
+                     tabular_data=table_data)
+
+    print(f"\n{table}\n\n{LN_SEP}\n")
+
+    # ----------------------------------------
+    # now run the search for the found macaddr
+    # ----------------------------------------
+
+    macaddr = table_data[0][1]
+
+    proceed = click.prompt(f"Search {n_devs} devices for MAC address {macaddr}? [Y/n]")
+    if proceed != 'Y':
+        raise click.Abort()
+
+    with alive_bar(n_devs) as bar:
+        res = nr_find_host_by_macaddr(
+            nr=nr, macaddr=macaddr, progress=bar
+        )
+
+    if not len(res):
+        print("No matches.")
+        return
+
+    table = tabulate(headers=['Hostname', 'VLAN', 'Interface'],
                      tabular_data=[
-                         [item['hostname'], item['macaddr'], item['interface']]
+                         [item['hostname'], item['vlan'], item['interface']]
                          for item in res
                      ])
 

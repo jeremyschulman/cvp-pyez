@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # =============================================================================
 # PURPOSE
 # -------
@@ -17,7 +17,6 @@
 import os
 import logging
 from functools import reduce
-from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # additional package imports
@@ -26,7 +25,6 @@ from datetime import datetime
 import maya
 import click
 from alive_progress import alive_bar
-from nornir import InitNornir
 from nornir.plugins.tasks.files import write_file
 from tabulate import tabulate
 
@@ -36,6 +34,7 @@ from tabulate import tabulate
 
 from cvppyez.log import setup_log
 from cvppyez.matcher import make_matcher
+from cvppyez.nornir import get_inventory
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
@@ -43,7 +42,7 @@ from cvppyez.matcher import make_matcher
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.3.0'                      # bump on each release
+PROG_VERSION = '0.4.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -51,49 +50,6 @@ DEFAULT_LOGLEVEL = 'warning'
 LN_SEP = "#" + "-" * 79
 TIME_FORMAT = "%Y-%m-%d (%a) %H:%M:%S"
 REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
-
-
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# !
-# !                             NORNIR
-# !
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-def nr_get_inventory(ctx):
-    """
-    This function will use the Nornir to gather the device inventory from CVP.
-    The User can provide a hostname based filter to apply to the complete
-    inventory so that they can limit the scope of the scan. As a result of this
-    processing the `ctx.obj.nr` will be set to the filtered list of devices to
-    scan.  The `ctx.obj.nr_all` is the complete CVP inventory.
-
-    Parameters
-    ----------
-    ctx : click.Context
-    """
-    log = ctx.obj.log
-
-    log.info(f"Gathering CVP inventory from {os.environ['CVP_SERVER']}")
-    start_ts = datetime.now()
-    nr = InitNornir(
-        core={
-            'num_workers': 100
-        },
-        inventory={
-            'plugin': 'cvppyez.nornir.CVPInventory'
-        }
-    )
-    end_ts = datetime.now()
-    collect_td = end_ts - start_ts
-
-    log.info(f"CVP inventory gather took: {collect_td}")
-
-    nr.inventory.defaults.username = os.environ['CVP_USER']
-    nr.inventory.defaults.password = os.environ['CVP_PASSWORD']
-
-    ctx.obj.nr_all = nr
-    ctx.obj.nr = (nr if not ctx.obj.match_hostname else
-                  nr.filter(filter_func=lambda h: ctx.obj.match_hostname(h.name)))
 
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -304,9 +260,13 @@ Patterns:
         # inventory from CVP.
 
         search_hostname = optargs['hostname']
-        ctx.obj.match_hostname = (None if not search_hostname else
-                                  make_matcher('hostname', search_hostname,
-                                               use_regex=optargs['use_regex']))
+        if not search_hostname:
+            ctx.obj.filter_func = None
+        else:
+            match_hostname = make_matcher(
+                name='hostname', value=search_hostname,
+                use_regex=optargs['use_regex'])
+            ctx.obj.filter_func = lambda h: match_hostname(h.name)
 
         super(Command, self).invoke(ctx)
 
@@ -433,10 +393,11 @@ def cli_get_logs(ctx, **optargs):
     """
     Get system logs from the device and save to local file.
     """
+
+    print_banner(ctx)
     print("Gathering CVP inventory, please wait.")
 
-    nr_get_inventory(ctx)
-    nr = ctx.obj.nr
+    nr = get_inventory(filter_func=ctx.obj.filter_func)
     n_devs = len(nr.inventory.hosts)
     if not n_devs:
         print("No devices match hostname filter")
@@ -446,8 +407,6 @@ def cli_get_logs(ctx, **optargs):
     if proceed != 'Y':
         raise click.Abort()
 
-    print_banner(ctx)
-
     # use a fancy progress bar to show progress. if you need to debug the task
     # using pdb/breakpoints, do not use this progress bar as it adds background
     # threading and prevents debuggin of tasks.
@@ -455,9 +414,6 @@ def cli_get_logs(ctx, **optargs):
     with alive_bar(len(nr.inventory.hosts)) as bar:
         res = nr.run(task=nr_task_get_logs, timeframe=optargs['last'],
                      progress=bar)
-
-    # NOTE: for debugging, replace the above with this
-    # nr.run(task=nr_task_get_logs)
 
     if res.failed:
         print("Execution errors detected on hosts:")
@@ -476,10 +432,10 @@ def cli_get_running(ctx, **optargs):
     """
     Get running configuration from the device and save to local file.
     """
-    print("Gathering CVP inventory, please wait.")
 
-    nr_get_inventory(ctx)
-    nr = ctx.obj.nr
+    print_banner(ctx)
+    print("Gathering CVP inventory, please wait.")
+    nr = get_inventory(filter_func=ctx.obj.filter_func)
     n_devs = len(nr.inventory.hosts)
     if not n_devs:
         print("No devices match hostname filter")
@@ -495,9 +451,6 @@ def cli_get_running(ctx, **optargs):
 
     with alive_bar(len(nr.inventory.hosts)) as bar:
         res = nr.run(task=nr_task_get_running_config, progress=bar)
-
-    # NOTE: for debugging, replace the above with this
-    # nr.run(task=nr_task_get_logs)
 
     if res.failed:
         print("Execution errors detected on hosts:")

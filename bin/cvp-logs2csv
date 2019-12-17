@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+
+import click
+from collections import defaultdict, namedtuple, Counter
+import re
+from datetime import datetime
+
+from tabulate import tabulate
+import maya
+from alive_progress import alive_bar
+import csv
+
+now = datetime.now()
+this_year = str(now.year)
+
+LN_SEP = "#" + "-" * 79
+EOS_DATE_FORMAT = "%Y %b %d %H:%M:%S"                      # 2019 Dec 14 09:36:58
+DATE_FORMAT = "%Y-%m-%d (%a) %I:%M:%S %p"
+
+LogMessage = namedtuple('LogMessage', [
+    'date',         # human
+    'timestamp',    # numeric
+    'host',         # device hostname
+    'agent',        # agent process generating the event
+    'type',         # event type
+    'interface',    # interface name found in message or empty-string
+    'message'       # str - message component
+])
+
+re_event_type = re.compile(r"%([\w-]+)")
+re_ifname = re.compile(r'(Ethernet[0-9/]+|Port-Channel[0-9]+)')
+
+
+def create_csv(logs, filename):
+    with open(filename, 'w+') as ofile:
+        print(f"{LN_SEP}\nCREATING: {ofile.name}")
+        csv_wr = csv.writer(ofile)
+        csv_wr.writerow(LogMessage._fields)
+        csv_wr.writerows(logs)
+
+
+@click.command()
+@click.argument(
+    'logfile',
+    type=click.File(),
+    required=True
+)
+def check_logs(logfile):
+    line_data = [
+        (f"{this_year} {line[:15]}", line[16:].strip())
+        for line in logfile.readlines()
+    ]
+    logs = list()
+    with alive_bar(len(line_data)) as bar:
+        for timestamp, logstring in line_data:
+            host_agent, _, log_str_data = logstring.partition(': ')
+            hostname, agent = host_agent.split()
+            dt = datetime.strptime(timestamp, EOS_DATE_FORMAT)
+            mdt = maya.parse(dt)
+            date = mdt.datetime(to_timezone='EST').strftime(DATE_FORMAT)
+            ev_type = re_event_type.search(log_str_data).group(1)
+            if_names = re_ifname.findall(log_str_data) or []
+
+            if ev_type == 'LLDP-5-NEIGHBOR_NEW' and len(if_names) > 1:
+                if_names.pop(0)
+
+            logs.append(LogMessage(date, dt.timestamp(),
+                                   hostname, agent, ev_type,
+                                   ','.join(if_names),
+                                   log_str_data))
+            bar()
+
+    count_by_type = Counter(log.type for log in logs)
+    print(tabulate(
+        headers=['SYSLOG Event', 'Count'],
+        tabular_data=sorted(count_by_type.items(), key=lambda i: i[1], reverse=True)
+    ))
+    examine = defaultdict(lambda: defaultdict(list))
+
+    for log in logs:
+        examine[log.type][log.host].append(log)
+
+    create_csv(logs, 'logs.csv')
+
+
+if __name__ == '__main__':
+    check_logs()

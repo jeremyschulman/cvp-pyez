@@ -32,7 +32,6 @@ def make_matcher(name, value, use_regex):
         except sre_constants.error:
             raise ValueError(
                 f'Bad regular expression for option {name}: {value}',
-
             )
 
         def regex_matcher(_in_val):

@@ -1,13 +1,11 @@
 import os
-from datetime import datetime
-import logging
 
 from nornir import InitNornir
 
 __all__ = ['get_inventory']
 
 
-def get_inventory(log=None, match_hostname=None):
+def get_inventory(filter_func=None):
     """
     This function will use the Nornir to gather the device inventory from CVP.
     The User can provide a hostname based filter to apply to the complete
@@ -17,35 +15,23 @@ def get_inventory(log=None, match_hostname=None):
 
     Parameters
     ----------
-    log : logger
-        If provided, will log to this logger; otherwise will use the standard
-        nornir logger.
-
-    match_hostname : callable
-        If provided, the inventory items will be filtered agaist hostnames that
-        match using the provided callable.
+    filter_func : callable
+        If provided, the inventory items will be filtered
     """
 
-    if not log:
-        log = logging.getLogger('nornir')
-
-    log.info(f"Gathering CVP inventory from {os.environ['CVP_SERVER']}")
-    start_ts = datetime.now()
     nr = InitNornir(
         core={
             'num_workers': 100
         },
         inventory={
             'plugin': 'cvppyez.nornir.CVPInventory'
+        },
+        logging={
+            'enabled': False
         }
     )
-    end_ts = datetime.now()
-    collect_td = end_ts - start_ts
-
-    log.info(f"CVP inventory gather took: {collect_td}")
 
     nr.inventory.defaults.username = os.environ['CVP_USER']
     nr.inventory.defaults.password = os.environ['CVP_PASSWORD']
 
-    return (nr if not match_hostname
-            else nr.filter(filter_func=lambda h: match_hostname(h.name)))
+    return nr if not filter_func else nr.filter(filter_func=filter_func)
