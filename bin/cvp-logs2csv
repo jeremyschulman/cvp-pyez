@@ -49,12 +49,14 @@ def check_logs(logfile):
     line_data = [
         (f"{this_year} {line[:15]}", line[16:].strip())
         for line in logfile.readlines()
+        if not line.startswith('Warning')
     ]
     logs = list()
     with alive_bar(len(line_data)) as bar:
         for timestamp, logstring in line_data:
             host_agent, _, log_str_data = logstring.partition(': ')
             hostname, agent = host_agent.split()
+
             dt = datetime.strptime(timestamp, EOS_DATE_FORMAT)
             mdt = maya.parse(dt)
             date = mdt.datetime(to_timezone='EST').strftime(DATE_FORMAT)

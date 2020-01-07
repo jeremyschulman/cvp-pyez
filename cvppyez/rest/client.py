@@ -59,7 +59,13 @@ class CvpSession(requests.Session):
 
     def login(self):
         res = self.post(self.URLs.LOGIN, json=self._auth)
-        res.raise_for_status()
+        body = res.json()
+        if 'errorCode' in body:
+            raise RuntimeError(
+                f'Unable to login to {self.host_url}: {body["errorMessage"]}. '
+                'Check credentials or remote-access reachability.'
+            )
+
         res = self.get(self.URLs.VERSION)
         res.raise_for_status()
         self.version = res.json()['version']

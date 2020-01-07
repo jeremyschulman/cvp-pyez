@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-# =============================================================================
+#
 # PURPOSE
 # -------
 #    This script is used to gather logging content from EOS devices using CVP
 #    as the inventory source. The collected log information is stored to a
 #    hostname specific file called <hostname>.log.
-#
 #
 #    For more information about this script use the "--help" command option.
 # =============================================================================
@@ -14,14 +13,17 @@
 # Python standard imports
 # -----------------------------------------------------------------------------
 
+import sys
 import os
 import logging
 from functools import reduce
+import json
 
 # -----------------------------------------------------------------------------
 # additional package imports
 # -----------------------------------------------------------------------------
 
+import yaml
 import maya
 import click
 from alive_progress import alive_bar
@@ -30,7 +32,7 @@ from tabulate import tabulate
 
 # -----------------------------------------------------------------------------
 # CVP PyEZ imports
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------`--------------------------
 
 from cvppyez.log import setup_log
 from cvppyez.matcher import make_matcher
@@ -42,7 +44,7 @@ from cvppyez.nornir import get_inventory
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.4.0'                      # bump on each release
+PROG_VERSION = '0.7.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -81,26 +83,40 @@ def nr_task_get_logs(task, timeframe, progress=None):
     # have lots of logs.
     # TODO: make the timeout a Command option.
 
-    np_dev = task.host.get_connection("napalm", task.nornir.config)
+    hostname = task.host.name
+
+    try:
+        np_dev = task.host.get_connection("napalm", task.nornir.config)
+
+    except Exception as exc:
+        print(f"\nERROR: unable to connect to device: {hostname}.\n")
+        if progress:
+            progress()
+        return
+
     eos_dev = np_dev.device
     eos_dev.connection.transport.timeout = 10 * 60       # extend for longer timeout period!
 
-    # collect the logs from the last 1 day
-    # TODO: make the collection period a Command option.
+    try:
+        cmd_res = eos_dev.run_commands(
+            commands=[
+                f'show logging last {timeframe}'
+            ],
+            encoding='text'
+        )
 
-    cmd_res = eos_dev.run_commands(
-        commands=[
-            f'show logging last {timeframe}'
-        ],
-        encoding='text'
-    )
+    except Exception as exc:
+        if progress:
+            progress()
+
+        print(f"\nERROR: {hostname}: {str(exc)}\n")
+        return
 
     # save the collected log output (text) to a file.
     # TODO: add Command option to indicate directory to store; maybe
     #       even the logging filename format.
 
     output = cmd_res[0]['output']
-    hostname = task.host.name
     task.run(task=write_file, filename=f'{hostname}.log', content=output)
 
     if progress:
@@ -148,6 +164,26 @@ def nr_task_get_running_config(task, progress=None):
         progress()
 
 
+def nr_task_get_show_commands(task, commands, progress=None):
+    np_dev = task.host.get_connection("napalm", task.nornir.config)
+    eos_dev = np_dev.device
+    output = dict()
+
+    for cmd_item in commands:
+        cmd_res = eos_dev.run_commands(
+            commands=[cmd_item['command']],
+            encoding=cmd_item.get('encoding') or 'json'
+        )
+        output[cmd_item['name']] = cmd_res[0]
+
+    hostname = task.host.name
+    task.run(task=write_file, filename=f'{hostname}.json',
+             content=json.dumps(output, indent=3))
+
+    if progress:
+        progress()
+
+
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
 # !                              Command REPORT BANNER
@@ -166,6 +202,15 @@ def print_banner(ctx):
         print(f'# LOG TIME-FRAME: {ctx.params["last"]}')
 
     print(LN_SEP)
+
+
+def print_errors(res):
+    print("Execution errors detected on hosts:")
+    failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
+    print(tabulate(
+        headers=['hostname', 'result'],
+        tabular_data=failed
+    ))
 
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -268,6 +313,22 @@ Patterns:
                 use_regex=optargs['use_regex'])
             ctx.obj.filter_func = lambda h: match_hostname(h.name)
 
+        print_banner(ctx)
+        print("Gathering CVP inventory, please wait.")
+
+        try:
+            nr = get_inventory(filter_func=ctx.obj.filter_func)
+        except RuntimeError as exc:
+            sys.exit(str(exc))
+
+        n_devs = len(nr.inventory.hosts)
+        if not n_devs:
+            print("No devices match hostname filter")
+            sys.exit(1)
+
+        ctx.obj.nr = nr
+        ctx.obj.n_devs = n_devs
+
         super(Command, self).invoke(ctx)
 
 
@@ -276,7 +337,13 @@ class GetLogsCommand(Command):
     This program is used to collect the device logging data for a specified
     period of time and save them to file.
     """
-    pass
+
+
+class GetShowCommand(Command):
+    cli_help = """
+    This program is used to collect the 'show' output from each of the devices
+    and store the results as JSON into ${hostanme}.json.
+    """
 
 
 # -----------------------------------------------------------------------------
@@ -309,6 +376,42 @@ opt_log_level = click.option(
     callback=lambda ctx, param, value: value.upper() if value is not None else None
 )
 
+
+def opts_shared(cmd_func):
+    """
+    Create a decorator that combines all of the common options (shared) across
+    multiple commands. The decorator approach is used by the click framework
+    to add options to a give command.  This this function effective "stacks"
+    a bunch of options as a single decorator.
+
+    Parameters
+    ----------
+    cmd_func : function to decorate
+
+    Returns
+    -------
+    function - cmd_func now stacked with the common options.
+    """
+    return reduce(
+        lambda _f, opt_func: opt_func(_f), [
+            opt_hostname, opt_use_regex,
+            opt_log, opt_log_level],
+        cmd_func)
+
+
+# -----------------------------------------------------------------------------
+#                                 CLICK Command COMMAND
+# -----------------------------------------------------------------------------
+
+@click.group()
+@click.version_option(PROG_VERSION)
+def cli():
+    pass
+
+
+# -----------------------------------------------------------------------------
+#                              'Get Logs' Command
+# -----------------------------------------------------------------------------
 
 def opt_log_lasttimeframe_check(ctx, param, value):
     """ EOS timeframe validator """
@@ -348,42 +451,6 @@ opt_log_lasttimeframe = click.option(
 )
 
 
-def opts_shared(cmd_func):
-    """
-    Create a decorator that combines all of the common options (shared) across
-    multiple commands. The decorator approach is used by the click framework
-    to add options to a give command.  This this function effective "stacks"
-    a bunch of options as a single decorator.
-
-    Parameters
-    ----------
-    cmd_func : function to decorate
-
-    Returns
-    -------
-    function - cmd_func now stacked with the common options.
-    """
-    return reduce(
-        lambda _f, opt_func: opt_func(_f), [
-            opt_hostname, opt_use_regex,
-            opt_log, opt_log_level],
-        cmd_func)
-
-
-# -----------------------------------------------------------------------------
-#                                 CLICK Command COMMAND
-# -----------------------------------------------------------------------------
-
-@click.group()
-@click.version_option(PROG_VERSION)
-def cli():
-    pass
-
-
-# -----------------------------------------------------------------------------
-#                                 CLICK Command COMMAND
-# -----------------------------------------------------------------------------
-
 @cli.command(name='logs', cls=GetLogsCommand)
 @click.version_option(PROG_VERSION)
 @opts_shared
@@ -394,14 +461,8 @@ def cli_get_logs(ctx, **optargs):
     Get system logs from the device and save to local file.
     """
 
-    print_banner(ctx)
-    print("Gathering CVP inventory, please wait.")
-
-    nr = get_inventory(filter_func=ctx.obj.filter_func)
-    n_devs = len(nr.inventory.hosts)
-    if not n_devs:
-        print("No devices match hostname filter")
-        return
+    n_devs = ctx.obj.n_devs
+    nr = ctx.obj.nr
 
     proceed = click.prompt(f"Collect logs from {n_devs} devices? [Y/n]")
     if proceed != 'Y':
@@ -416,13 +477,12 @@ def cli_get_logs(ctx, **optargs):
                      progress=bar)
 
     if res.failed:
-        print("Execution errors detected on hosts:")
-        failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
-        print(tabulate(
-            headers=['hostname', 'result'],
-            tabular_data=failed
-        ))
+        print_errors(res)
 
+
+# -----------------------------------------------------------------------------
+#                         Get Configs CLI Command
+# -----------------------------------------------------------------------------
 
 @cli.command(name='configs', cls=GetLogsCommand)
 @click.version_option(PROG_VERSION)
@@ -433,13 +493,8 @@ def cli_get_running(ctx, **optargs):
     Get running configuration from the device and save to local file.
     """
 
-    print_banner(ctx)
-    print("Gathering CVP inventory, please wait.")
-    nr = get_inventory(filter_func=ctx.obj.filter_func)
-    n_devs = len(nr.inventory.hosts)
-    if not n_devs:
-        print("No devices match hostname filter")
-        return
+    n_devs = ctx.obj.n_devs
+    nr = ctx.obj.nr
 
     proceed = click.prompt(f"Collect from {n_devs} devices? [Y/n]")
     if proceed != 'Y':
@@ -453,13 +508,45 @@ def cli_get_running(ctx, **optargs):
         res = nr.run(task=nr_task_get_running_config, progress=bar)
 
     if res.failed:
-        print("Execution errors detected on hosts:")
-        failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
-        print(tabulate(
-            headers=['hostname', 'result'],
-            tabular_data=failed
-        ))
+        print_errors(res)
 
+
+# -----------------------------------------------------------------------------
+#                         Get Show CLI Command
+# -----------------------------------------------------------------------------
+
+@cli.command(name='run', cls=GetShowCommand)
+@click.version_option(PROG_VERSION)
+@opts_shared
+@click.option(
+    '--commands', type=click.File(),
+    required=True,
+    help='YAML file containing show commands'
+)
+@click.pass_context
+def cli_get_run_commands(ctx, commands, **optargs):
+    """
+    Run a set of operational commands and store the outputs to $hostname JSON file.
+    """
+
+    n_devs = ctx.obj.n_devs
+    nr = ctx.obj.nr
+
+    proceed = click.prompt(f"Collect show command outputs from {n_devs} devices? [Y/n]")
+    if proceed != 'Y':
+        raise click.Abort()
+
+    # use a fancy progress bar to show progress. if you need to debug the task
+    # using pdb/breakpoints, do not use this progress bar as it adds background
+    # threading and prevents debuggin of tasks.
+
+    with alive_bar(len(nr.inventory.hosts)) as bar:
+        res = nr.run(task=nr_task_get_show_commands,
+                     commands=yaml.safe_load(commands),
+                     progress=bar)
+
+    if res.failed:
+        print_errors(res)
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !

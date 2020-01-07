@@ -1,14 +1,5 @@
-#!/usr/bin/env python3
-# =============================================================================
-# PURPOSE
-# -------
-#
-#    This program is used to push configuration from a file to a collection of
-#    devices; the inventory is taken from CVP and Nornir is used to execute the
-#    change. A dry-run option is supported as well.
-#
-#    For more information about this script use the "--help" command option.
-# =============================================================================
+#!/usr/bin/env python
+
 
 # -----------------------------------------------------------------------------
 # Python standard imports
@@ -16,26 +7,33 @@
 
 import sys
 import os
+import json
 import logging
+from collections import defaultdict
+from datetime import datetime
+import csv
+import itertools
 from functools import reduce
+from string import Template
 
 # -----------------------------------------------------------------------------
 # additional package imports
 # -----------------------------------------------------------------------------
 
+import yaml
 import maya
 import click
 from alive_progress import alive_bar
-from nornir.plugins.tasks.networking import napalm_configure
+from nornir.plugins.tasks.files import write_file
 from tabulate import tabulate
+from cvppyez.matcher import make_matcher
+from cvppyez.nornir import get_inventory
 
 # -----------------------------------------------------------------------------
 # CVP PyEZ imports
 # -----------------------------------------------------------------------------
 
 from cvppyez.log import setup_log
-from cvppyez.matcher import make_matcher
-from cvppyez.nornir import get_inventory
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
@@ -43,7 +41,7 @@ from cvppyez.nornir import get_inventory
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.2.0'                      # bump on each release
+PROG_VERSION = '0.3.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -53,37 +51,54 @@ TIME_FORMAT = "%Y-%m-%d (%a) %H:%M:%S"
 REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
 
 
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# !
-# !                               NORNIR
-# !
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+def nr_get_inventory(ctx, hostnames):
+    print_banner(ctx)
+    print("Gathering CVP inventory, please wait.")
 
-def nr_task_push_config(task, dry_run, configuration, progress=None):
-    """
-    This Nornir task is used to wrap the napalm_configure so that we can
-    include the fancy progress bar.
+    def from_hostnames(h):
+        return h.name in hostnames and ctx.obj.filter_func(h)
 
-    Parameters
-    ----------
-    task : Nornir Task
-    dry_run : bool
-    configuration : str - the config to push
-    progress : callable - used to indicate progress
+    try:
+        nr = get_inventory(filter_func=from_hostnames)
 
-    Returns
-    -------
-    None
-    """
+    except RuntimeError as exc:
+        sys.exit(str(exc))
 
-    res = task.run(task=napalm_configure,
-                   dry_run=dry_run,
-                   configuration=configuration)
+    n_devs = len(nr.inventory.hosts)
+    if not n_devs:
+        print("No devices match hostname filter")
+        sys.exit(1)
+
+    ctx.obj.nr = nr
+    ctx.obj.n_devs = n_devs
+
+
+def nr_task_run_interface_commands(task, commands, dev_ifs, progress=None):
+
+    np_dev = task.host.get_connection("napalm", task.nornir.config)
+    eos_dev = np_dev.device
+
+    hostname = task.host.name
+    if_names = dev_ifs[hostname]
+
+    cmd_outputs = dict()
+
+    for if_name in if_names:
+
+        for cmd_item in commands:
+
+            eos_cmd = cmd_item['command'].substitute(interface=if_name)
+            cmd_res = eos_dev.run_commands(
+                commands=[eos_cmd],
+                encoding=cmd_item['encoding']
+            )
+            cmd_outputs[cmd_item['name']] = cmd_res[0]
+
+    task.run(task=write_file, filename=f'{hostname}.json',
+             content=json.dumps(cmd_outputs, indent=3))
 
     if progress:
         progress()
-
-    return res
 
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -99,11 +114,25 @@ def print_banner(ctx):
     print(f"# {ctx.obj.prog_name}, version {PROG_VERSION}")
     print(f"# CVP: {ctx.obj.cvp_user}@{ctx.obj.cvp_server}")
     print(f"# TIME: {nowtime}")
+
+    if ctx.info_name == 'logs':
+        print(f'# LOG TIME-FRAME: {ctx.params["last"]}')
+
     print(LN_SEP)
 
 
+
+def print_errors(res):
+    print("Execution errors detected on hosts:")
+    failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
+    print(tabulate(
+        headers=['hostname', 'result'],
+        tabular_data=failed
+    ))
+
+
 def print_list_devices(nr):
-    for host in nr.inventory.hosts:
+    for host in sorted(nr.inventory.hosts):
         print(host)
 
 
@@ -123,10 +152,43 @@ class CLIContext(object):
 
 class Command(click.Command):
     cli_help = """
-    This command is used to push configs from a local file to devices."""
+This command is used to execute a list of operational commands for a give set 
+of host,interfaces, and store the results into JSON files, one per host.  
 
-    cvp_help = \
-        """
+You must provide two input files:
+
+--inventory <file> is a CSV file that must contain at least two columns,
+"host" and "interface".  The first line in the file must contain the column headers.
+
+--commands <file> is a YAML file that contains a list of the commands to execute.  The structure
+of this file is a list, that looks like this:
+
+# BEGIN EXAMPLE YAML FILE
+
+---
+- name: stats
+  command: show interfaces $interface
+
+- name: vlans
+  command: show interfaces $interface vlans
+  encoding: text
+
+- name: macaddrs
+  command: show mac address-table interface $interface
+
+# END EXAMPLE YAML FILE
+
+The 'name' field must be unique and designates the purpose of the command.  This value is also
+used when storing the results of the command into the $host JSON output file.
+
+The 'command' is the EOS command to execute with the $interface keyword used to designated
+where the actual interface name is to be placed.
+
+The 'encoding' option is used to designate if the command should return JSON data or TEXT output.
+The default is JSON.
+    """
+
+    cvp_help = """
     You must setup the following environment variables:
 
         *  CVP_SERVER = hostname of your CVP server
@@ -134,47 +196,18 @@ class Command(click.Command):
         *  CVP_PASSWORD = your login password
 
     This program will use CVP to obtain the inventory, filter it based on your
-    options, and then access the EOS devices over the eAPI directly.
+    options, and then scan the EOS devices over the eAPI directly.
     """
-
-    pattern_help = \
-        """
-Patterns: 
-    <glob-pattern>
-
-        Glob pattern matching is what is generally used with filepatterns in Unix
-        For example:
-
-            'foo*'          - All strings that start with 'foo'
-            'foo[12]*'      - All strings that start with foo1 or foo2
-
-        More online: https://en.wikipedia.org/wiki/Glob_(programming)
-
-    <regex-pattern>
-
-        Regular express matching.  If you're a network engineer, you're probably
-        familiar with regular expressiosn.   For example:
-
-            'sp.*'          - All strings that begin with 'sp'
-            '(sp|tr).*'     - All strings that begin with either 'sp' or 'tr'
-
-        More online: https://regex101.com/
-        """
 
     def get_help(self, ctx):
         """ customize the --help output """
         return '\n'.join([
             self.cli_help,
             self.cvp_help,
-            super(Command, self).get_help(ctx),
-            self.pattern_help
+            super(Command, self).get_help(ctx)
         ])
 
     def invoke(self, ctx):
-
-        # ensure that all required Environment variables are setup before
-        # running the commands.
-
         ctx.obj = CLIContext()
 
         try:
@@ -196,34 +229,15 @@ Patterns:
         log_level = optargs['log_level']
         log.setLevel(logging.getLevelName(log_level.upper()))
 
-        # if the User provided a hostname filter, then setup for that matching.
-        # the `match_hostname` function will be used when collecting the Nornir
-        # inventory from CVP.
-
         search_hostname = optargs['hostname']
         if not search_hostname:
-            ctx.obj.filter_func = None
+            ctx.obj.filter_func = lambda h: True
+
         else:
             match_hostname = make_matcher(
                 name='hostname', value=search_hostname,
                 use_regex=optargs['use_regex'])
             ctx.obj.filter_func = lambda h: match_hostname(h.name)
-
-        print_banner(ctx)
-        print("Gathering CVP inventory, please wait.")
-
-        try:
-            nr = get_inventory(filter_func=ctx.obj.filter_func)
-        except RuntimeError as exc:
-            sys.exit(str(exc))
-
-        n_devs = len(nr.inventory.hosts)
-        if not n_devs:
-            print("No devices match hostname filter")
-            sys.exit(1)
-
-        ctx.obj.nr = nr
-        ctx.obj.n_devs = n_devs
 
         super(Command, self).invoke(ctx)
 
@@ -231,17 +245,6 @@ Patterns:
 # -----------------------------------------------------------------------------
 #                           Command options
 # -----------------------------------------------------------------------------
-
-opt_config_file = click.option(
-    '--configfile', required=True,
-    type=click.File(),
-    help='File containing configuraiton to push to devices'
-)
-
-opt_dry_run = click.option(
-    '--dry-run', is_flag=True,
-    help='Use dry-run mode for checking (no config commit)'
-)
 
 opt_use_regex = click.option(
     '-R', '--use-regex',
@@ -287,7 +290,6 @@ def opts_shared(cmd_func):
     """
     return reduce(
         lambda _f, opt_func: opt_func(_f), [
-            opt_config_file, opt_dry_run,
             opt_hostname, opt_use_regex,
             opt_log, opt_log_level],
         cmd_func)
@@ -300,18 +302,67 @@ def opts_shared(cmd_func):
 @click.command(cls=Command)
 @click.version_option(PROG_VERSION)
 @opts_shared
+@click.option(
+    'inventory',
+    '--inventory', '-i',
+    type=click.File(),
+    required=True,
+    help='CSV file of host,interface'
+)
+@click.option(
+    'commands',
+    '--commands', '-c',
+    type=click.File(),
+    required=True,
+    help='YAML file of commands to execute'
+)
 @click.pass_context
-def cli_push_config(ctx, configfile, **optargs):
-    """
-    Push configuration from file to devices.
-    """
+def cli_run_commands(ctx, inventory, commands, **optargs):
+
+    try:
+        commands_data = yaml.safe_load(commands)
+
+    except Exception as exc:
+        sys.exit(f"Unable to load YAML command file: {str(exc)}")
+
+    # -------------------------------------------------------------------------
+    # next, ensure that each of the commands has a $interface designation,
+    # convert the command into a Template instance, and ensure there is a
+    # command encoding (defaults to json).
+    # -------------------------------------------------------------------------
+
+    for cmd_item in commands_data:
+        cmd = cmd_item['command']
+        if '$interface' not in cmd:
+            print(f"ERROR: command missing $interface: '{cmd}'")
+            sys.exit(2)
+
+        cmd_item['command'] = Template(cmd)
+        if 'encoding' not in cmd_item:
+            cmd_item['encoding'] = 'json'
+
+    # -------------------------------------------------------------------------
+    # now read the inventory CSV file and create a hash of device hostnames
+    # that provide a list of interfaces.  Using that hostname list, as well as
+    # the --hostname option obtain the CVP inventory of hosts into a Nornir
+    # inventory instance.
+    # -------------------------------------------------------------------------
+
+    csv_rd = csv.reader(inventory)
+    csv_ds = defaultdict(set)
+
+    _ = next(csv_rd)     # read header line and discard
+    for rec in csv_rd:
+        csv_ds[rec[0]].add(rec[1])
+
+    nr_get_inventory(ctx, hostnames=list(csv_ds))
 
     n_devs = ctx.obj.n_devs
     nr = ctx.obj.nr
 
     proceed = None
     while proceed not in ['Y', 'n']:
-        proceed = click.prompt(f"Configure {n_devs} devices? [Y/n/l]")
+        proceed = click.prompt(f"Run commands on {n_devs} devices? [Y/n/l]")
         if proceed == 'l':
             print_list_devices(nr)
 
@@ -323,29 +374,13 @@ def cli_push_config(ctx, configfile, **optargs):
     # threading and prevents debuggin of tasks.
 
     with alive_bar(n_devs) as bar:
-        res = nr.run(task=nr_task_push_config, progress=bar,
-                     dry_run=optargs['dry_run'],
-                     configuration=configfile.read())
+        res = nr.run(task=nr_task_run_interface_commands,
+                     commands=commands_data,
+                     dev_ifs=csv_ds,
+                     progress=bar)
 
     if res.failed:
-        print("Execution errors detected on hosts:")
-        failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
-        print(tabulate(
-            headers=['hostname', 'result'],
-            tabular_data=failed
-        ))
-
-    table = tabulate(
-        headers=['Hostname', 'Diff'],
-        tabular_data=[
-            [host, bool(h_res[1].diff)]
-            for host, h_res in res.items()
-        ]
-    )
-
-    print_banner(ctx)
-    print(f"\n{table}\n\n{LN_SEP}\n")
-
+        print_errors(res)
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
@@ -355,7 +390,7 @@ def cli_push_config(ctx, configfile, **optargs):
 
 
 def main():
-    cli_push_config()
+    cli_run_commands()
 
 
 if __name__ == "__main__":

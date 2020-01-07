@@ -44,11 +44,39 @@ class CVPInventory(Inventory):
         cvp = CVPRestClient()
         res = cvp.api.get('/inventory/devices')
         res.raise_for_status()
+        body = res.json()
 
         hosts = {
             dev['fqdn']: dict(hostname=dev['ipAddress'])
-            for dev in res.json()
+            for dev in body
         }
+
+        sn_to_hn = {dev['serialNumber']: dev['fqdn'] for dev in body}
+        host_sn_keys = set(sn_to_hn)
+
+        # now obtain the device status information for two reason:
+        # (1) remove any hosts that are not active
+        # (2) remove any hosts that are not _present_ in the status area
+
+        # TODO: should probably log these inactive hosts somewhere.
+
+        res = cvp.api.get('$a/DatasetInfo/Devices')
+        res.raise_for_status()
+        host_status = cvp.extracto_notifications(res.json())
+        host_status_sn_keys = set(host_status)
+
+        # (1) - remove any hosts that are not active
+        for host_ds in host_status.values():
+            hostname = host_ds['hostname']
+            if host_ds['status'] != 'active':
+                print(f"WARNING: removing inactive host: {hostname}")
+                del hosts[hostname]
+
+        # (2) remove any hosts that are not _present_ in the status area
+        for nonexist_sn in host_sn_keys - host_status_sn_keys:
+            hostname = sn_to_hn[nonexist_sn]
+            print(f"WARNING: removing 'zombie' host: {hostname}")
+            del hosts[hostname]
 
         groups = {}
         groupby_tags = kwargs.get('groupby_tags')
