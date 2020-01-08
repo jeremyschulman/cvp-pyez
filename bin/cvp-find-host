@@ -42,7 +42,7 @@ from cvppyez.nornir import get_inventory
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.4.0'                      # bump on each release
+PROG_VERSION = '0.5.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -452,9 +452,9 @@ def cli_find_host_mac(ctx, macaddr, **optargs):
         )
 
     print("Gathering CVP inventory, please wait.")
-    get_inventory(ctx)
-    nr = ctx.obj.search_nr
+    nr = get_inventory(filter_func=ctx.obj.filter_func)
     n_devs = len(nr.inventory.hosts)
+
     proceed = click.prompt(f"Search {n_devs} devices for MAC address {macaddr}? [Y/n]")
     if proceed != 'Y':
         raise click.Abort()
@@ -501,7 +501,6 @@ def cli_find_host_ip(ctx, ipaddr, **optargs):
 
     print_banner(ctx)
     print("Gathering CVP inventory, please wait.")
-
     nr = get_inventory(filter_func=ctx.obj.filter_func)
     n_devs = len(nr.inventory.hosts)
 
