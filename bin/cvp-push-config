@@ -16,8 +16,8 @@
 
 import sys
 import os
-import logging
 from functools import reduce
+import logging
 
 # -----------------------------------------------------------------------------
 # additional package imports
@@ -26,8 +26,11 @@ from functools import reduce
 import maya
 import click
 from alive_progress import alive_bar
-from nornir.plugins.tasks.networking import napalm_configure
 from tabulate import tabulate
+
+from nornir.plugins.tasks.networking import napalm_configure
+from nornir.core.exceptions import NornirSubTaskError
+from nornir.core.task import Result
 
 # -----------------------------------------------------------------------------
 # CVP PyEZ imports
@@ -43,7 +46,7 @@ from cvppyez.nornir import get_inventory
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.2.0'                      # bump on each release
+PROG_VERSION = '0.4.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -52,6 +55,8 @@ LN_SEP = "#" + "-" * 79
 TIME_FORMAT = "%Y-%m-%d (%a) %H:%M:%S"
 REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
 
+logger = logging.getLogger()
+
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !
@@ -59,10 +64,11 @@ REQ_ENV_VARS = ('CVP_SERVER', 'CVP_USER', 'CVP_PASSWORD')
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-def nr_task_push_config(task, dry_run, configuration, progress=None):
+def nr_task_push_config(task, dry_run, configuration, progress):
     """
     This Nornir task is used to wrap the napalm_configure so that we can
-    include the fancy progress bar.
+    include the fancy progress bar.  This code will also abort any pending
+    configuration sessions.
 
     Parameters
     ----------
@@ -76,13 +82,27 @@ def nr_task_push_config(task, dry_run, configuration, progress=None):
     None
     """
 
-    res = task.run(task=napalm_configure,
-                   dry_run=dry_run,
-                   configuration=configuration)
+    nr_device = task.host.get_connection("napalm", task.nornir.config)
+    eos_device = nr_device.device
+    sess = eos_device.run_commands(["show configuration sessions"])[0]["sessions"]
+    pending_sessions = [k for k, v in sess.items() if v["state"] == "pending"]
 
-    if progress:
-        progress()
+    if pending_sessions:
+        print(f'WARNING: clearing pending sessions: {" ".join(pending_sessions)}')
+        eos_device.run_commands([f"configure session {session} abort"
+                                for session in pending_sessions])
 
+    try:
+        res = task.run(task=napalm_configure,
+                       dry_run=dry_run,
+                       configuration=configuration)
+
+    except NornirSubTaskError as exc:
+        reason = exc.result.exception
+        res = Result(host=task.host, failed=True,
+                     result=str(reason), exception=reason)
+
+    progress()
     return res
 
 
@@ -285,12 +305,13 @@ def opts_shared(cmd_func):
     -------
     function - cmd_func now stacked with the common options.
     """
-    return reduce(
-        lambda _f, opt_func: opt_func(_f), [
-            opt_config_file, opt_dry_run,
-            opt_hostname, opt_use_regex,
-            opt_log, opt_log_level],
-        cmd_func)
+    options = [opt_config_file, opt_dry_run,
+               opt_hostname, opt_use_regex,
+               opt_log, opt_log_level]
+
+    return reduce(lambda _f, opt_func: opt_func(_f),
+                  options,
+                  cmd_func)
 
 
 # -----------------------------------------------------------------------------
@@ -323,12 +344,18 @@ def cli_push_config(ctx, configfile, **optargs):
     # threading and prevents debuggin of tasks.
 
     with alive_bar(n_devs) as bar:
-        res = nr.run(task=nr_task_push_config, progress=bar,
+        res = nr.run(task=nr_task_push_config,
                      dry_run=optargs['dry_run'],
-                     configuration=configfile.read())
+                     configuration=configfile.read(),
+                     progress=bar)
+
+    # res = nr.run(task=nr_task_push_config,
+    #              dry_run=optargs['dry_run'],
+    #              configuration=configfile.read(),
+    #              progress=lambda: True)
 
     if res.failed:
-        print("Execution errors detected on hosts:")
+        print("\nERRORS detected on hosts:")
         failed = [[host, h_res.result] for host, h_res in res.items() if h_res.failed]
         print(tabulate(
             headers=['hostname', 'result'],
@@ -340,6 +367,7 @@ def cli_push_config(ctx, configfile, **optargs):
         tabular_data=[
             [host, bool(h_res[1].diff)]
             for host, h_res in res.items()
+            if not h_res.failed
         ]
     )
 

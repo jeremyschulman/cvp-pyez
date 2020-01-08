@@ -2,7 +2,7 @@ import logging
 
 
 def setup_log(filename):
-    new_log = logging.getLogger(__name__)
+    new_log = logging.getLogger()
     new_log.setLevel(logging.WARNING)
 
     sh = logging.FileHandler(filename)

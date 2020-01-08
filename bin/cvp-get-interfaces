@@ -81,7 +81,7 @@ def nr_task_run_interface_commands(task, commands, dev_ifs, progress=None):
     hostname = task.host.name
     if_names = dev_ifs[hostname]
 
-    cmd_outputs = dict()
+    cmd_outputs = defaultdict(dict)
 
     for if_name in if_names:
 
@@ -92,7 +92,7 @@ def nr_task_run_interface_commands(task, commands, dev_ifs, progress=None):
                 commands=[eos_cmd],
                 encoding=cmd_item['encoding']
             )
-            cmd_outputs[cmd_item['name']] = cmd_res[0]
+            cmd_outputs[if_name][cmd_item['name']] = cmd_res[0]
 
     task.run(task=write_file, filename=f'{hostname}.json',
              content=json.dumps(cmd_outputs, indent=3))
