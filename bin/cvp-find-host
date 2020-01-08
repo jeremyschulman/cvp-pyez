@@ -42,7 +42,7 @@ from cvppyez.nornir import get_inventory
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.5.0'                      # bump on each release
+PROG_VERSION = '0.6.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -102,7 +102,7 @@ def nr_task_find_ipaddr(task, ipaddr, progress=None):
     return r_items if len(r_items) else None
 
 
-def nr_find_host_by_ipaddr(nr, ipaddr, progress=None):
+def nr_find_host_by_ipaddr(nr, ipaddr, progress):
     """
     This function will execute the find-ip function against all hosts in the
     `nr` Nornir object.  Any found item will be returned as a list of dict;
@@ -142,7 +142,7 @@ def nr_find_host_by_ipaddr(nr, ipaddr, progress=None):
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-def nr_task_find_mac(task, macaddr, progress=None):
+def nr_task_find_mac(task, macaddr, all_ports, progress):
     """
     This Nornir task is used to locate the given `macaddr` on the device.  If
     the MACADDR is found on Eth interfaces, then this function will return a
@@ -159,6 +159,7 @@ def nr_task_find_mac(task, macaddr, progress=None):
     ----------
     task : Nornir.task
     macaddr : str - the MACADDR value to find
+    all_ports : bool - do not filter on Eth
     progress : function to declare progress
 
     Returns
@@ -181,8 +182,7 @@ def nr_task_find_mac(task, macaddr, progress=None):
 
     mac_entries = cmd_res[0]['unicastTable']['tableEntries']
 
-    if progress:
-        progress()
+    progress()
 
     # if the MACADDR is not found, then return None
 
@@ -194,13 +194,13 @@ def nr_task_find_mac(task, macaddr, progress=None):
     r_items = [
         (entry['vlanId'], entry['interface'])
         for entry in mac_entries
-        if entry['interface'].startswith('Eth')
+        if all_ports or entry['interface'].startswith('Eth')
     ]
 
     return r_items if len(r_items) else None
 
 
-def nr_find_host_by_macaddr(nr, macaddr, progress=None):
+def nr_find_host_by_macaddr(nr, macaddr, all_ports, progress):
     """
     This function will execute the find-mac function against all hosts in the
     `inv` Nornir object.  Any found item will be returned as a list of dict; where
@@ -210,6 +210,7 @@ def nr_find_host_by_macaddr(nr, macaddr, progress=None):
     ----------
     nr : Nornir instance
     macaddr : str - MACADDR to find
+    all_ports : bool - do not filter on Eth
     progress : callable - indicates progress
 
     Returns
@@ -217,7 +218,8 @@ def nr_find_host_by_macaddr(nr, macaddr, progress=None):
     list[dict] as described.
     """
 
-    res = nr.run(task=nr_task_find_mac, macaddr=macaddr, progress=progress)
+    res = nr.run(task=nr_task_find_mac, macaddr=macaddr,
+                 all_ports=all_ports, progress=progress)
 
     # there will be a result for each of the hosts in the `inv` instance. We
     # want to filter on only those results that are not None.  So the code
@@ -433,16 +435,28 @@ def cli():
     pass
 
 
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                          CLI FIND HOST BY MACADDR
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
 @cli.command(name='mac', cls=Command)
 @click.argument(
     'macaddr',
     metavar='[MAC address]'
 )
 @opts_shared
+@click.option(
+    '--all-ports', '-a',
+    is_flag=True,
+    help='Find MAC on any interface type'
+)
 @click.pass_context
 def cli_find_host_mac(ctx, macaddr, **optargs):
     """
-    Find end-host by MAC address.
+    Find MAC address on Eth ports; unless --all-ports.
     """
     v_macaddr = optargs['macaddr'] = validators.validate_macaddr(macaddr)
     if not v_macaddr:
@@ -461,7 +475,8 @@ def cli_find_host_mac(ctx, macaddr, **optargs):
 
     with alive_bar(len(nr.inventory.hosts)) as bar:
         res = nr_find_host_by_macaddr(
-            nr=nr, macaddr=v_macaddr, progress=bar
+            nr=nr, macaddr=v_macaddr, all_ports=optargs['all_ports'],
+            progress=bar
         )
 
     if not len(res):
@@ -478,6 +493,12 @@ def cli_find_host_mac(ctx, macaddr, **optargs):
 
     print(f"\n{table}\n\n{LN_SEP}\n")
 
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !
+# !                          CLI FIND HOST BY IP ADDR
+# !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 @cli.command(name='ip', cls=Command)
 @click.argument(
