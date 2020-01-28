@@ -42,7 +42,7 @@ from cvppyez.nornir import get_inventory
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.6.0'                      # bump on each release
+PROG_VERSION = '0.7.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -78,11 +78,15 @@ def nr_task_find_ipaddr(task, ipaddr, progress=None):
 
     np_dev = task.host.get_connection("napalm", task.nornir.config)
 
-    cmd_res = np_dev.device.run_commands(
-        commands=[
-            f'show ip arp {ipaddr}'
-        ]
-    )
+    try:
+        cmd_res = np_dev.device.run_commands(
+            commands=[
+                f'show ip arp {ipaddr}'
+            ]
+        )
+    except Exception as exc:
+        print(f"\nERROR: {task.host.name}: {str(exc)}")
+        return None
 
     ip_entries = cmd_res[0]['ipV4Neighbors']
 
@@ -174,11 +178,16 @@ def nr_task_find_mac(task, macaddr, all_ports, progress):
     # but use the direct pyEAPI device so we get back structured data and not
     # Command text
 
-    cmd_res = np_dev.device.run_commands(
-        commands=[
-            f'show mac address-table address {macaddr}'
-        ]
-    )
+    try:
+        cmd_res = np_dev.device.run_commands(
+            commands=[
+                f'show mac address-table address {macaddr}'
+            ]
+        )
+
+    except Exception as exc:
+        print(f"\nERROR: host {task.host.name}: {str(exc)}")
+        return None
 
     mac_entries = cmd_res[0]['unicastTable']['tableEntries']
 
