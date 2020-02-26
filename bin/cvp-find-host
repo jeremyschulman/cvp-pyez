@@ -42,7 +42,7 @@ from cvppyez.nornir import get_inventory
 # !
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-PROG_VERSION = '0.7.0'                      # bump on each release
+PROG_VERSION = '0.8.0'                      # bump on each release
 
 DEFAULT_LOGFILE = "/dev/null"
 DEFAULT_LOGLEVEL = 'warning'
@@ -515,6 +515,11 @@ def cli_find_host_mac(ctx, macaddr, **optargs):
     metavar='[IP address]'
 )
 @opts_shared
+@click.option(
+    '--all-ports', '-a',
+    is_flag=True,
+    help='Find MAC on any interface type'
+)
 @click.pass_context
 def cli_find_host_ip(ctx, ipaddr, **optargs):
     """
@@ -573,7 +578,8 @@ def cli_find_host_ip(ctx, ipaddr, **optargs):
 
     with alive_bar(n_devs) as bar:
         res = nr_find_host_by_macaddr(
-            nr=nr, macaddr=macaddr, progress=bar
+            nr=nr, macaddr=macaddr, progress=bar,
+            all_ports=optargs['all_ports']
         )
 
     if not len(res):
